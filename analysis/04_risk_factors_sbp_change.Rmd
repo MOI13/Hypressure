@@ -1,0 +1,370 @@
+---
+title: "Baseline Risk Factors for Change in Systolic Blood Pressure"
+date: "`r format(Sys.time(), '%x')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    df_print: paged
+  word_document:
+    toc: false
+    toc_depth: 3
+    reference_docx: null
+knitr:
+  opts_chunk:
+    fig.align: center
+    fig.height: 6
+    fig.width: 9
+    results: markup
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, message = F, warning = F)
+
+if(!require("pacman")) 
+  install.packages("pacman")
+
+pacman::p_load(
+  DescTools, tidyverse, magrittr, janitor, here, flextable,
+  knitr, kableExtra, 
+  gt, gtsummary, broom,
+  lme4, lmerTest, patchwork
+)
+
+source(here("analysis", "00_table_style.R"))
+source(here("analysis", "00_figure_style.R"))
+```
+
+```{r load data}
+# rm(list = ls()); gc()
+visit_long <- readRDS(here::here("data", "intermediate", "visit_long.RDS"))
+## same participants as the risk factor report: free of hypertension at entry
+htn_free   <- readRDS(here("data", "intermediate", "incident.hypertension.first.RDS"))
+```
+
+**Question:** Among participants without hypertension at entry, how does systolic blood pressure (SBP) change over follow-up, and is the rate of change associated with baseline age (per 10 years), sex, and BMI, after accounting for antihypertensive medication use at each visit?
+
+```{r}
+## entry and scheduled clinic visits only, where both BP and medication are recorded
+## (medication is not recorded at home or unofficial visits)
+sbp_long <- visit_long %>%
+  filter(id %in% htn_free$id) %>%
+  filter(str_detect(visit_type, "^(entry|m\\d+)") | visit_date == entry_date) %>%
+  filter(!is.na(mean_sbp), !is.na(bmi_category)) %>%
+  mutate(
+    years       = as.numeric(visit_date - entry_date) / 365.25,
+    follow_year = pmin(round(years), 7),
+    ## age per 10 years as in the risk factor report, centered at 50 
+    ## so the reference annual change refers to a 50-year-old (age coefficients are unchanged)
+    age_c10     = (age - 50) / 10,
+    sex         = factor(sex, levels = c("Female", "Male")),
+    ## time-varying: medication use recorded at each clinic visit
+    bp_med      = any_bp_med
+  )
+
+# summary(sbp_long$years)
+# n_distinct(sbp_long$id)
+```
+
+The analysis includes `r format(n_distinct(sbp_long$id), big.mark = ",")` participants with `r format(nrow(sbp_long), big.mark = ",")` clinic visits (entry and scheduled visits at months 12 to 84). Visit SBP is the mean of the second and third readings.
+
+
+## Mean SBP over Follow-up
+```{r}
+## average within each person-year first so participants with extra visits don't dominate
+mean_sbp_year <- function(df, group_var = "overall") {
+  df %>%
+    mutate(group = if (group_var == "overall") "All participants" else as.character(.data[[group_var]])) %>%
+    filter(!is.na(group)) %>%
+    group_by(id, group, follow_year) %>%
+    summarise(sbp = mean(mean_sbp), .groups = "drop") %>%
+    group_by(group, follow_year) %>%
+    summarise(
+      n     = n(),
+      mean  = mean(sbp),
+      lower = mean - 1.96 * sd(sbp) / sqrt(n),
+      upper = mean + 1.96 * sd(sbp) / sqrt(n),
+      .groups = "drop"
+    )
+}
+
+plot_mean_sbp <- function(group_var, title) {
+  p <- mean_sbp_year(sbp_long, group_var) %>%
+    ggplot(aes(x = follow_year, y = mean, color = group, fill = group)) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.15, color = NA) +
+    geom_line() +
+    geom_point() +
+    scale_x_continuous(breaks = 0:7) +
+    scale_color_strata(group_var) +
+    scale_fill_strata(group_var) +
+    labs(x = "Years since entry", y = "Mean SBP, mmHg", title = title) +
+    guides(color = guide_legend(nrow = 2), fill = guide_legend(nrow = 2)) +
+    theme_journal()
+
+  if (group_var == "overall") p <- p + theme(legend.position = "none")
+  p
+}
+```
+
+```{r, fig.height=9, fig.width=10}
+fig_mean <- (plot_mean_sbp("overall", "A. Overall") + plot_mean_sbp("age_group", "B. Age group")) /
+  (plot_mean_sbp("sex", "C. Sex") + plot_mean_sbp("bmi_category", "D. BMI category")) +
+  plot_annotation(
+    title = "Figure 1. Mean systolic blood pressure by year of follow-up",
+    caption = "Shaded bands are 95% CIs.",
+    theme = theme(plot.title = element_text(face = "bold", margin = margin(b = 14)))
+  )
+
+fig_mean
+```
+
+
+## Model Diagnostics
+```{r}
+## random slope only: entry SBP was restricted to the normotensive range, so the
+## random intercept variance was estimated at zero (singular fit)
+m_adj <- lmer(mean_sbp ~ years * (age_c10 + sex + bmi_category) + bp_med + (0 + years | id),
+              data = sbp_long)
+
+## fit checks: should be FALSE and empty
+# isSingular(m_adj)
+# m_adj@optinfo$conv$lme4$messages
+```
+
+```{r, fig.height=7, fig.width=9}
+re_adj <- ranef(m_adj)$id
+
+par(mfrow = c(2, 2), bty = "l", las = 1, tcl = -0.3,
+    mar = c(4, 4, 2, 1) + 0.1, 
+    oma = c(0, 0, 1, 0))
+
+# Plot 1: Residuals vs fitted
+plot(fitted(m_adj), resid(m_adj),
+     main = "Residuals vs Fitted", xlab = "Fitted SBP", ylab = "Residual",
+     pch = 16, cex = 0.3, col = adjustcolor("black", 0.3), cex.main = 1)
+abline(h = 0, lty = 3, col = col_ref, lwd = 1.5)
+
+# Plot 2: Residuals vs years
+plot(sbp_long$years, resid(m_adj),
+     main = "Residuals vs Years", xlab = "Years since entry", ylab = "Residual",
+     pch = 16, cex = 0.3, col = adjustcolor("black", 0.3), cex.main = 1)
+abline(h = 0, lty = 3, col = col_ref, lwd = 1.5)
+
+# Plot 3: Residual normality
+qqnorm(resid(m_adj), main = "Q-Q Plot: Residuals", pch = 16, cex = 0.3, col = "black", cex.main = 1)
+qqline(resid(m_adj), lty = 3, col = col_ref, lwd = 1.5)
+
+# Plot 4: Random slope normality
+qqnorm(re_adj[, "years"], main = "Q-Q Plot: Random Slopes", pch = 16, cex = 0.4, col = "black", cex.main = 1)
+qqline(re_adj[, "years"], lty = 3, col = col_ref, lwd = 1.5)
+
+mtext("Figure 2. Model diagnostics", outer = TRUE, adj = 0, font = 2, cex = 0.9)
+```
+
+
+## Modeling
+A linear mixed-effects model was constructed to evaluate the association between baseline risk factors and the rate of change in SBP. The model included years since entry, age (per 10 years), sex, and BMI category, the interaction of each factor with time, and antihypertensive medication use at each visit as a time-varying covariate. Each participant has a random slope for time. A random intercept was not included because SBP at entry was restricted to the normotensive range, leaving too little between-person variation to estimate it. The medication term adjusts for treatment started during follow-up and should not be read as a treatment effect, because medication is started when BP is high.
+
+```{r}
+## lmerTest coefficients with Wald 95% CI (used instead of broom.mixed::tidy)
+tidy_lmer <- function(x, conf.level = 0.95, ...) {
+  z <- qnorm(1 - (1 - conf.level) / 2)
+  coef(summary(x)) %>%
+    as.data.frame() %>%
+    rownames_to_column("term") %>%
+    transmute(
+      term,
+      estimate  = Estimate,
+      std.error = `Std. Error`,
+      statistic = `t value`,
+      p.value   = `Pr(>|t|)`,
+      conf.low  = estimate - z * std.error,
+      conf.high = estimate + z * std.error
+    )
+}
+
+fixed_adj <- tidy_lmer(m_adj)
+```
+
+```{r}
+## table built from the coefficients directly
+## (gtsummary's tbl_regression() requires broom.mixed for mixed models)
+term_labels <- c(
+  "years"                   = "Years since entry (reference group)",
+  "age_c10"                 = "Age, per 10 years",
+  "bmi_categoryUnderweight" = "Underweight vs normal weight",
+  "bmi_categoryOverweight"  = "Overweight vs normal weight",
+  "bmi_categoryObesity"     = "Obesity vs normal weight",
+  "sexMale"                 = "Male vs female",
+  "bp_med"                  = "On BP medication at the visit"
+)
+
+table_blocks <- c("Difference in SBP, mmHg", "Difference in annual change in SBP, mmHg/year")
+
+table_data <- fixed_adj %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    ## main effects give the SBP difference, interactions with time give the difference in annual change
+    term_base    = str_remove(term, "^years:"),
+    Block        = factor(if_else(str_detect(term, "^years"), table_blocks[2], table_blocks[1]), levels = table_blocks),
+    Term         = unname(term_labels[term_base]),
+    Estimate     = sprintf("%.2f (%.2f to %.2f)", estimate, conf.low, conf.high),
+    P            = style_pvalue(p.value, digits = 2)
+  ) %>%
+  arrange(Block, match(term_base, names(term_labels))) %>%
+  select(Block, Term, Estimate, P) %>%
+  as_grouped_data(groups = "Block")
+
+## block header rows vs coefficient rows
+block_rows <- which(!is.na(table_data$Block))
+
+sbp_table <- table_data %>%
+  as_flextable(hide_grouplabel = TRUE) %>%
+  ## \u03b2 is the beta symbol (non-ASCII names can't be typed inside backticks on Windows)
+  set_header_labels(Term = "", Estimate = "\u03b2 (95% CI)", P = "P value") %>%
+  journal_table(
+    title = "Table 1. Associations of baseline factors and medication use with systolic blood pressure over follow-up",
+    notes = c(
+      "Difference in SBP: difference at entry for baseline factors, and at visits on versus off medication for BP medication. Difference in annual change: difference in yearly SBP change versus the reference group.",
+      "Reference group: woman aged 50 at entry with normal BMI, not on BP medication. P values use Satterthwaite degrees of freedom."
+    ),
+    indent_rows = setdiff(seq_len(nrow(table_data)), block_rows)
+  ) %>%
+  bold(i = block_rows, part = "body")
+
+sbp_table
+```
+
+```{r}
+## predicted population-average SBP by one factor, other factors at reference,
+## never on BP medication during follow-up
+## age groups are shown at a representative age: 25, 35, 45, 55, and 70 years
+ref_values <- tibble(
+  age_c10      = 0,
+  sex          = factor("Female", levels = c("Female", "Male")),
+  bmi_category = factor("Normal weight", levels = levels(sbp_long$bmi_category)),
+  bp_med       = 0
+)
+
+predict_by <- function(model, group_var) {
+  groups <- switch(group_var,
+    sex          = tibble(sex = factor(c("Female", "Male"), levels = c("Female", "Male"))),
+    bmi_category = tibble(bmi_category = factor(levels(sbp_long$bmi_category), levels = levels(sbp_long$bmi_category))),
+    age_group    = tibble(age_c10 = (c(25, 35, 45, 55, 70) - 50) / 10, group = levels(sbp_long$age_group)),
+  )
+
+  grid <- expand_grid(
+    ref_values %>% select(-any_of(names(groups))),
+    groups,
+    years = seq(0, 7, by = 0.25)
+  ) %>%
+    mutate(group = if (group_var == "age_group") group else as.character(.data[[group_var]]))
+
+  ## fixed-effect prediction with a Wald 95% CI
+  X  <- model.matrix(delete.response(terms(model)), grid)
+  X  <- X[, names(fixef(model)), drop = FALSE]
+  vc <- as.matrix(vcov(model))
+
+  grid %>%
+    mutate(
+      group_var = group_var,
+      fit   = as.vector(X %*% fixef(model)),
+      se    = sqrt(rowSums((X %*% vc) * X)),
+      lower = fit - 1.96 * se,
+      upper = fit + 1.96 * se
+    ) %>%
+    select(group_var, group, years, fit, lower, upper)
+}
+```
+
+```{r}
+plot_pred_sbp <- function(group_var, title) {
+  predict_by(m_adj, group_var) %>%
+    ggplot(aes(x = years, y = fit, color = group, fill = group)) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.15, color = NA) +
+    geom_line() +
+    scale_x_continuous(breaks = 0:7) +
+    scale_color_strata(group_var) +
+    scale_fill_strata(group_var) +
+    labs(x = "Years since entry", y = "Predicted SBP, mmHg", title = title) +
+    guides(color = guide_legend(nrow = 2), fill = guide_legend(nrow = 2)) +
+    theme_journal()
+}
+```
+
+```{r, fig.height=5, fig.width=12}
+## BP medication is time-varying, so it is not shown as a group comparison;
+## it stays in the model as an adjustment (constant shift, no interaction with time)
+fig_pred <- plot_pred_sbp("age_group", "A. Age group") + 
+  plot_pred_sbp("sex", "B. Sex") + 
+  plot_pred_sbp("bmi_category", "C. BMI category") +
+  plot_annotation(
+    title = "Figure 3. Predicted systolic blood pressure from the mixed-effects model",
+    caption = "Shaded bands are 95% CIs. Each panel varies one factor; the others are set to age 50, female, and normal BMI, never on BP medication during follow-up.",
+    theme = theme(plot.title = element_text(face = "bold", margin = margin(b = 14)))
+  )
+
+fig_pred
+```
+
+
+## Summary
+```{r}
+slope_ref <- fixed_adj %>% filter(term == "years")
+med_eff   <- fixed_adj %>% filter(term == "bp_med")
+
+change_sig <- fixed_adj %>%
+  filter(str_detect(term, "^years:"), p.value < 0.05) %>%
+  mutate(
+    phrase = case_when(
+      term == "years:age_c10" ~ "age",
+      term == "years:sexMale" ~ "sex",
+      TRUE ~ paste(tolower(str_remove(term, "years:bmi_category")), "BMI")
+    )
+  )
+
+answer_04 <- paste0(
+  sprintf("For a woman aged 50 at entry with normal BMI and not on BP medication, SBP rose by %.2f mmHg per year (95%% CI %.2f to %.2f). ",
+          slope_ref$estimate, slope_ref$conf.low, slope_ref$conf.high),
+  if (nrow(change_sig) == 0) {
+    "No baseline factor (age, sex, or BMI) was statistically significantly associated with the rate of change in SBP. "
+  } else {
+    paste0("The rate of change in SBP differed significantly by ", 
+           paste(unique(change_sig$phrase), collapse = ", "), ". ")
+  },
+  sprintf("At visits on BP medication, SBP was %.2f mmHg %s (95%% CI %.2f to %.2f) than at visits off medication.",
+          abs(med_eff$estimate), if_else(med_eff$estimate > 0, "higher", "lower"),
+          med_eff$conf.low, med_eff$conf.high)
+)
+```
+
+`r answer_04`
+
+```{r save results}
+## results for the dashboard
+sbp_results <- list(
+  question = "Among participants without hypertension at entry, how does systolic BP change over follow-up, and is the rate of change associated with baseline age (per 10 years), sex, and BMI, after accounting for antihypertensive medication use at each visit?",
+  answer   = answer_04,
+  sbp_long = sbp_long %>% select(id, years, follow_year, mean_sbp, sex, age_group, bmi_category, bp_med),
+  table    = sbp_table,
+  fig_mean = fig_mean,
+  fig_pred = fig_pred,
+  ## difference in annual change for each baseline factor
+  effects  = fixed_adj %>%
+    filter(str_detect(term, "^years:")) %>%
+    mutate(
+      label = case_when(
+        term == "years:age_c10" ~ "Age, per 10 years",
+        term == "years:sexMale" ~ "Male",
+        TRUE ~ str_remove(term, "years:bmi_category")
+      )
+    ),
+  ## fixed effects and their covariance, so the dashboard can predict SBP for any settings
+  fixef    = fixef(m_adj),
+  vcov     = as.matrix(vcov(m_adj)),
+  n_obs    = nobs(m_adj),
+  n_id     = ngrps(m_adj)[["id"]]
+)
+
+saveRDS(sbp_results, here("data", "intermediate", "04_sbp_change.RDS"))
+```

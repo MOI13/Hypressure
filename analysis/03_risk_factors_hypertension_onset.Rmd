@@ -1,0 +1,420 @@
+---
+title: "Baseline Risk Factors for Hypertension Onset"
+date: "`r format(Sys.time(), '%x')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 5
+    df_print: paged
+  word_document:
+    toc: false
+    toc_depth: 3
+    reference_docx: null
+knitr:
+  opts_chunk:
+    fig.align: center
+    fig.height: 8
+    fig.width: 10
+    results: markup
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, message = F, warning = F)
+
+if(!require("pacman")) 
+  install.packages("pacman")
+
+pacman::p_load(
+  DescTools, tidyverse, magrittr, janitor, here, flextable,
+  knitr, kableExtra, 
+  gt, gtsummary, labelled, broom, survival 
+)
+
+source(here("analysis", "00_table_style.R"))
+source(here("analysis", "00_figure_style.R"))
+```
+
+```{r load data}
+# rm(list = ls()); gc()
+visit_long <- readRDS(here::here("data", "intermediate", "visit_long.RDS"))
+events <- readRDS(here("data", "intermediate", "incident.hypertension.first.RDS"))
+```
+
+**Question:** Among participants without hypertension at entry, which baseline factors (age, sex, BMI) are associated with developing hypertension?
+
+```{r}
+## BMI category and age group come from 01_make_data.R
+events2 <- events %>%
+  mutate(
+    time_to_event = person_years,
+    status        = as.numeric(event),
+    age_10yr      = age_at_entry / 10,
+    sex           = factor(sex, levels = c("Female", "Male"))
+  ) 
+
+# summary(events2)
+# table(events2$bmi_category)
+```
+
+```{r}
+## PH test table, used for both univariate and multivariable diagnostics
+ph_table <- function(ph_summary, title) {
+  ph_summary %>%
+    mutate(
+      chisq = sprintf("%.2f", chisq),
+      p     = style_pvalue(p, digits = 2)
+    ) %>%
+    flextable() %>%
+    set_header_labels(
+      Variable = "Baseline risk factor",
+      chisq    = "\u03c7\u00b2",
+      df       = "df",
+      p        = "P value"
+    ) %>%
+    add_header_row(
+      values = c("", "Schoenfeld residuals test"),
+      colwidths = c(1, 3)
+    ) %>%
+    journal_table(
+      title = title,
+      notes = "P < .05 indicates a violation of the proportional hazards assumption."
+    )
+}
+```
+
+
+## Univariate Analysis
+### Proportional Hazards Diagnostic
+```{r}
+cox_age <- coxph(Surv(time_to_event, status) ~ age_10yr, data = events2)
+zph_age <- cox.zph(cox_age)
+
+cox_sex <- coxph(Surv(time_to_event, status) ~ sex, data = events2)
+zph_sex <- cox.zph(cox_sex)
+
+cox_bmi <- coxph(Surv(time_to_event, status) ~ bmi_category, data = events2)
+zph_bmi <- cox.zph(cox_bmi)
+```
+
+```{r}
+ph_summary <- bind_rows(
+  as.data.frame(zph_age$table) %>% rownames_to_column("Source") %>% mutate(Variable = "Age"),
+  as.data.frame(zph_sex$table) %>% rownames_to_column("Source") %>% mutate(Variable = "Sex"),
+  as.data.frame(zph_bmi$table) %>% rownames_to_column("Source") %>% mutate(Variable = "BMI category")
+) %>%
+  filter(!str_detect(Source, "(?i)GLOBAL")) %>% 
+  select(Variable, chisq, df, p)
+
+ph_table(ph_summary, title = "Table 1. Proportional hazards diagnostics, univariate Cox models")
+```
+
+```{r}
+par(mfrow = c(2, 2), bty = "l", las = 1, tcl = -0.3,
+    mar = c(3, 4, 2, 1) + 0.1, 
+    oma = c(0, 0, 1, 0))
+
+# Plot 1: Age
+plot(zph_age, 
+     main = "Schoenfeld Residuals: Age", 
+     ylab = "Beta(t)", 
+     col = col_main, 
+     lwd = 2, cex.main = 1)
+abline(h = 0, lty = 3, col = col_ref, lwd = 1.5)
+
+# Plot 2: Sex
+plot(zph_sex, 
+     main = "Schoenfeld Residuals: Sex", 
+     ylab = "Beta(t)",
+     col = col_main, 
+     lwd = 2, cex.main = 1)
+abline(h = 0, lty = 3, col = col_ref, lwd = 1.5)
+
+# Plot 3: BMI
+plot(zph_bmi, 
+     main = "Schoenfeld Residuals: BMI Category", 
+     ylab = "Beta(t)", 
+     col = col_main, 
+     lwd = 2, cex.main = 1)
+abline(h = 0, lty = 3, col = col_ref, lwd = 1.5)
+```
+
+### Modeling 
+```{r}
+## Sex violates PH: split follow-up at 3 years (based on the Schoenfeld residual plot for sex)
+## and estimate a separate sex effect in each window
+sex_split <- survSplit(
+  Surv(time_to_event, status) ~ ., 
+  data = events2, 
+  cut = 3, 
+  episode = "group"
+  ) %>%
+  mutate(
+    male = as.numeric(sex == "Male"),
+    hv1  = male * (group == 1),   ## male effect, years 0-3
+    hv2  = male * (group == 2)    ## male effect, after year 3
+  )
+
+cox_sex_hv <- coxph(Surv(tstart, time_to_event, status) ~ hv1 + hv2 + cluster(id), data = sex_split)
+
+# cox_sex_hv <- coxph(Surv(tstart, time_to_event, status) ~ sex*strata(group), data = sex_split)
+# summary(cox_sex_hv)
+```
+
+
+```{r}
+tbl_age <- tbl_regression(cox_age, exponentiate = TRUE, label = list(age_10yr ~ "Age, per 10 years"))
+tbl_bmi <- tbl_regression(cox_bmi, exponentiate = TRUE, label = list(bmi_category ~ "BMI category"))
+
+tbl_sex <- tbl_regression(
+  cox_sex_hv, 
+  exponentiate = TRUE,
+  include = c("hv1", "hv2"),
+  label = list(
+    hv1 = "Male, years 0-3",
+    hv2 = "Male, after year 3"
+  )
+) %>%
+  ## for formatting: add a Sex header and a Female reference row above the two time windows
+  modify_table_body(~ {
+    row_parent <- tibble(
+      variable = "sex_parent",
+      var_type = "categorical",
+      var_label = "Sex",
+      label = "Sex",
+      row_type = "label"
+    )
+    
+    row_ref <- tibble(
+      variable = "sex_ref",
+      var_type = "categorical",
+      var_label = "Sex",
+      label = "Female",
+      row_type = "level",
+      reference_row = TRUE
+    )
+    
+    bind_rows(row_parent, row_ref, .x) %>%
+      mutate(row_type = ifelse(variable %in% c("hv1", "hv2"), "level", row_type))
+  })
+
+```
+
+
+```{r}
+univ_table <- tbl_stack(
+  tbls = list(tbl_age, tbl_bmi, tbl_sex)
+)
+
+univ_ft <- univ_table %>%
+  modify_header(label = "", estimate = "**Unadjusted HR (95% CI)**") %>%
+  ## drop the default gtsummary footnotes and abbreviation line, notes are added below the table
+  remove_footnote_header() %>%
+  remove_abbreviation() %>%
+  as_flex_table() %>%
+  journal_table(
+    title = "Table 2. Unadjusted associations between baseline factors and incident hypertension",
+    notes = c(
+      "Abbreviations: BMI, body mass index; HR, hazard ratio.",
+      "Incident hypertension confirmed at the first clinical visit. Deaths were treated as censoring, so HRs are cause-specific.",
+      "The sex effect is estimated separately for years 0-3 and after year 3 because it violated the proportional hazards assumption; robust standard errors clustered by participant."
+    )
+  )
+
+univ_ft
+```
+
+## Multivariate Analysis
+
+### Proportional Hazard Diagnosis 
+```{r}
+cox_all <- coxph(
+  Surv(time_to_event, status) ~ age_10yr + sex + bmi_category, 
+  data = events2
+)
+
+zph_all <- cox.zph(cox_all)
+```
+
+```{r}
+ph_summary <- as.data.frame(zph_all$table) %>%
+  rownames_to_column("Variable") %>%
+  filter(!str_detect(Variable, "(?i)GLOBAL")) %>%
+  mutate(
+    Variable = case_when(
+      Variable == "age_10yr" ~ "Age",
+      Variable == "sex" ~ "Sex",
+      str_detect(Variable, "bmi_category") ~ "BMI category",
+      TRUE ~ Variable
+    )
+  ) %>%
+  select(Variable, chisq, df, p)
+
+ph_table(ph_summary, title = "Table 3. Proportional hazards diagnostics, multivariable Cox model")
+```
+
+```{r}
+par(mfrow = c(2, 2), bty = "l", las = 1, tcl = -0.3,
+    mar = c(3, 4, 2, 1) + 0.1, 
+    oma = c(0, 0, 1, 0))
+
+plot(zph_all[1], 
+     main = "Schoenfeld Residuals: Age (Adjusted)", 
+     ylab = "Beta(t)", col = col_main, lwd = 2, cex.main = 0.9)
+abline(h = 0, lty = 3, col = col_ref, lwd = 1.5)
+
+plot(zph_all[2], 
+     main = "Schoenfeld Residuals: Sex (Adjusted)", 
+     ylab = "Beta(t)", col = col_main, lwd = 2, cex.main = 0.9)
+abline(h = 0, lty = 3, col = col_ref, lwd = 1.5)
+
+plot(zph_all[3], 
+     main = "Schoenfeld Residuals: BMI Category (Adjusted)", 
+     ylab = "Beta(t)", col = col_main, lwd = 2, cex.main = 0.9)
+abline(h = 0, lty = 3, col = col_ref, lwd = 1.5)
+```
+
+
+### Modeling
+```{r}
+cox_all_hv <- coxph(Surv(tstart, time_to_event, status) ~ age_10yr + bmi_category + hv1 + hv2 + cluster(id), 
+                    data = sex_split)
+
+## significant terms for the summary text
+mv_sig <- tidy(cox_all_hv, exponentiate = TRUE) %>%
+  filter(p.value < 0.05) %>%
+  mutate(
+    label = case_when(
+      term == "age_10yr" ~ "age",
+      str_detect(term, "bmi_category") ~ paste("BMI category", str_remove(term, "bmi_category")),
+      term == "hv1" ~ "male sex in years 0-3",
+      term == "hv2" ~ "male sex after year 3",
+      TRUE ~ term
+    )
+  )
+```
+
+A multivariable Cox proportional hazards regression model was constructed to evaluate the independent association between baseline risk factors and an incident hypertension event. An outcome event was defined as the first clinical visit during follow-up where a participant had a blood pressure measurement of $\ge$ 130/80 mmHg or recorded antihypertensive medication use. The model adjusted for age (per 10-year increment), body mass index (BMI) category, and sex. Deaths were treated as censoring, so the hazard ratios are cause-specific.
+
+Because sex violated the proportional hazards assumption in preliminary diagnostics, follow-up was split at 3 years and the sex effect was estimated separately for an early phase (years 0–3) and a late phase (after year 3).
+
+`r if (nrow(mv_sig) == 0) "No baseline factor was statistically significantly associated with incident hypertension over follow-up." else paste0("Statistically significant associations with incident hypertension were found for ", paste(mv_sig$label, collapse = ", "), ".")`
+
+
+```{r}
+mv_table <- tbl_regression(
+  cox_all_hv, 
+  exponentiate = TRUE,
+  label = list(
+    age_10yr     = "Age, per 10 years",
+    bmi_category = "BMI category",
+    hv1          = "Male, years 0-3",
+    hv2          = "Male, after year 3"
+  )
+) %>%
+  ## for formatting: Sex header and Female reference row above the two time windows
+  modify_table_body(~ {
+    idx <- which(.x$variable == "hv1")[1]
+    row_parent <- tibble(
+      variable = "sex_parent", var_type = "categorical",
+      var_label = "Sex", label = "Sex", row_type = "label"
+    )
+    row_ref <- tibble(
+      variable = "sex_ref", var_type = "categorical",
+      var_label = "Sex", label = "Female", row_type = "level",
+      reference_row = TRUE
+    )
+    
+    .x <- .x %>%
+      mutate(row_type = ifelse(variable %in% c("hv1", "hv2"), "level", row_type))
+
+    bind_rows(
+      .x %>% filter(row_number() < idx),
+      row_parent,
+      row_ref,
+      .x %>% filter(row_number() >= idx)
+    )
+  })
+
+mv_ft <- mv_table %>%
+  modify_header(label = "", estimate = "**Adjusted HR (95% CI)**") %>%
+  ## drop the default gtsummary footnotes and abbreviation line, notes are added below the table
+  remove_footnote_header() %>%
+  remove_abbreviation() %>%
+  as_flex_table() %>%
+  journal_table(
+    title = "Table 4. Adjusted associations between baseline factors and incident hypertension",
+    notes = c(
+      "Abbreviations: BMI, body mass index; HR, hazard ratio.",
+      "Multivariable Cox model adjusted for all factors shown. Deaths were treated as censoring, so HRs are cause-specific.",
+      "The sex effect is estimated separately for years 0-3 and after year 3; robust standard errors clustered by participant."
+    )
+  )
+
+mv_ft
+```
+
+
+## Summary
+```{r}
+answer_03 <- if (nrow(mv_sig) == 0) {
+  "No baseline factor (age, sex, or BMI) was statistically significantly associated with developing hypertension after mutual adjustment."
+} else {
+  paste0("After covariates adjustment, ", paste(mv_sig$label, collapse = ", "), 
+         if_else(nrow(mv_sig) == 1, " was", " were"),
+         " statistically significantly associated with developing hypertension.")
+}
+```
+
+`r answer_03`
+
+```{r save results}
+## results for the dashboard
+hr_label <- function(term) {
+  case_when(
+    term == "age_10yr" ~ "Age, per 10 years",
+    str_detect(term, "bmi_category") ~ paste0("BMI: ", str_remove(term, "bmi_category")),
+    term == "hv1" ~ "Male, years 0-3",
+    term == "hv2" ~ "Male, after year 3",
+    TRUE ~ term
+  )
+}
+
+hr_results <- bind_rows(
+  bind_rows(
+    tidy(cox_age, exponentiate = TRUE, conf.int = TRUE),
+    tidy(cox_bmi, exponentiate = TRUE, conf.int = TRUE),
+    tidy(cox_sex_hv, exponentiate = TRUE, conf.int = TRUE)
+  ) %>% mutate(Model = "Unadjusted"),
+  tidy(cox_all_hv, exponentiate = TRUE, conf.int = TRUE) %>% mutate(Model = "Adjusted")
+) %>%
+  mutate(label = hr_label(term)) %>%
+  select(Model, term, label, estimate, conf.low, conf.high, p.value)
+
+## cumulative incidence (1 - Kaplan-Meier) by each baseline factor
+cum_incidence <- lapply(c("sex", "age_group", "bmi_category"), function(v) {
+  fit <- survfit(as.formula(paste("Surv(time_to_event, status) ~", v)), data = events2)
+  tidy(fit) %>%
+    transmute(
+      group_var = v,
+      group     = str_remove(strata, ".*="),
+      time,
+      cum_inc   = 1 - estimate,
+      lower     = 1 - conf.high,
+      upper     = 1 - conf.low
+    )
+}) %>%
+  bind_rows()
+
+onset_results <- list(
+  question = "Among participants without hypertension at entry, which baseline factors (age, sex, BMI) are associated with developing hypertension?",
+  answer   = answer_03,
+  tables   = list(unadjusted = univ_ft, adjusted = mv_ft),
+  hr       = hr_results,
+  cum_inc  = cum_incidence,
+  n        = nrow(events2),
+  events   = sum(events2$status)
+)
+
+saveRDS(onset_results, here("data", "intermediate", "03_hypertension_onset.RDS"))
+```

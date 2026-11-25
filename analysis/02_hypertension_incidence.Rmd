@@ -1,0 +1,292 @@
+---
+title: "Hypertension Incidence Calculation"
+date: "`r format(Sys.time(), '%x')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    df_print: paged
+  word_document:
+    toc: false
+    toc_depth: 3
+    reference_docx: null
+knitr:
+  opts_chunk:
+    fig.align: center
+    fig.height: 8
+    fig.width: 9
+    results: markup
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, message = F, warning = F)
+
+if(!require("pacman")) 
+  install.packages("pacman")
+
+pacman::p_load(
+  DescTools, tidyverse, magrittr, janitor, here, flextable,
+  knitr, kableExtra, 
+  gt, gtsummary, labelled
+)
+
+source(here("analysis", "00_table_style.R"))
+```
+
+```{r load data}
+# rm(list = ls()); gc()
+visit_long <- readRDS(here::here("data", "intermediate", "visit_long.RDS"))
+
+```
+
+**Question:** Among participants without hypertension at entry, how often does hypertension develop, overall and by sex and age group, when it takes one versus two qualifying visits to confirm it?
+
+A qualifying visit has blood pressure ≥130/80 mmHg or antihypertensive medication use. Two event definitions are compared:
+
+- **First clinical visit:** hypertension starts at the first clinical visit after entry that qualifies (scheduled and unofficial visits; home visits not counted).
+- **Second clinical or home visit:** hypertension starts at the second qualifying visit after entry, counting both clinical and home visits.
+
+# Incident Hypertension Analysis
+```{r}
+# identify high BP at entry 
+## subjects with missing baseline BP and no BP medication can't be identified as hypertensive,
+## they are still considered non-prevalent at baseline
+first_visit <- visit_long %>%
+  group_by(id) %>%
+  arrange(visit_date) %>%
+  slice(1) %>%
+  ungroup()
+
+prevalent_ids <- first_visit %>%
+  filter(mean_sbp >= 130 | mean_dbp >= 80 | any_bp_med == 1) %>%
+  pull(id)
+
+## for footnotes
+n_prevalent  <- length(prevalent_ids)
+n_missing_bp <- first_visit %>%
+  filter(is.na(mean_sbp) & is.na(mean_dbp) & any_bp_med == 0) %>%
+  nrow()
+```
+
+```{r}
+event_aggregate_calculate <- function(df, group_var = NULL) {
+  if (!is.null(group_var)) {
+    df <- df %>% group_by(Category = as.character(.data[[group_var]]))
+  }
+
+  out <- df %>%
+    summarise(
+      Disease_Free_n = sum(event == 0),
+      Events_n       = sum(event == 1),
+      Total_PY       = sum(person_years),
+      Incidence_1000 = (Events_n / Total_PY) * 1000,
+      ## exact Poisson 95% CI
+      CI_lower       = qchisq(0.025, 2 * Events_n) / 2 / Total_PY * 1000,
+      CI_upper       = qchisq(0.975, 2 * (Events_n + 1)) / 2 / Total_PY * 1000,
+      .groups = "drop"
+    )
+
+  if (is.null(group_var)) out <- out %>% mutate(Category = "Total", .before = 1)
+  out
+}
+
+
+## rates overall, by sex and by age group
+incidence_data <- function(event_df) {
+  bind_rows(
+    event_aggregate_calculate(event_df) %>% mutate(Group = "Total"),
+    event_aggregate_calculate(event_df, "sex") %>% mutate(Group = "Sex"),
+    event_aggregate_calculate(event_df, "age_group") %>% mutate(Group = "Age group")
+  )
+}
+
+
+incidence_table <- function(inc_data, title, notes) {
+  table_data <- bind_rows(
+    inc_data %>% filter(Group == "Total"),
+    ## for formatting
+    tibble(Category = "Sex"),
+    inc_data %>% filter(Group == "Sex"),
+    tibble(Category = "Age group"),
+    inc_data %>% filter(Group == "Age group")
+  ) %>%
+    mutate(
+      Disease_Free_n = formatC(Disease_Free_n, format = "d", big.mark = ","),
+      Events_n       = formatC(Events_n, format = "d", big.mark = ","),
+      Total_PY       = formatC(Total_PY, format = "f", digits = 1, big.mark = ","),
+      Incidence_1000 = sprintf("%.2f (%.2f-%.2f)", Incidence_1000, CI_lower, CI_upper),
+      ## blank the label rows
+      across(c(Disease_Free_n, Events_n, Total_PY, Incidence_1000), 
+             ~ if_else(Category %in% c("Sex", "Age group"), "", .x))
+    ) %>%
+    select(Category, Disease_Free_n, Events_n, Total_PY, Incidence_1000)
+
+  level_rows <- which(!table_data$Category %in% c("Total", "Sex", "Age group"))
+
+  table_data %>%
+    flextable() %>%
+    set_header_labels(
+      Category       = "",
+      Disease_Free_n = "Disease free, No.",
+      Events_n       = "Events, No.",
+      Total_PY       = "Person-years",
+      Incidence_1000 = "Incidence per 1,000 person-years (95% CI)"
+    ) %>%
+    journal_table(title = title, notes = notes, indent_rows = level_rows)
+}
+```
+
+
+## First Clinical Visit Confirmation
+The event date is the very first time a participant is observed with high blood pressure or starts medication after their entry into the study.
+
+```{r}
+## unofficial visits are counted as clinical contacts here, only home visits are excluded
+event_A_subjects <- visit_long %>%
+  filter(!id %in% prevalent_ids & !(visit_type %in% c("home", "entry"))) %>%
+  group_by(id) %>%
+  arrange(id, visit_date) %>%
+  mutate(
+    is_high = case_when(
+      mean_sbp >= 130 | mean_dbp >= 80 | any_bp_med == 1 ~ 1,
+      TRUE ~ 0  
+    )
+  ) %>%
+  summarise(
+    event = if_else(any(is_high == 1), 1, 0),
+    event_date = if_else(event == 1, 
+                         min(visit_date[is_high == 1]), 
+                         first(exit_date)),   ## fallback to exit date 
+    sex = first(sex),
+    age_at_entry = first(age), 
+    age_group = first(age_group),
+    bmi_category = first(bmi_category),
+    entry_date = first(entry_date),
+    .groups = "drop"
+  ) %>%
+  mutate(person_years = as.numeric(event_date - entry_date) / 365.25)
+
+saveRDS(event_A_subjects, here("data", "intermediate", "incident.hypertension.first.RDS"))
+
+
+## subjects with only home visits after entry drop out of definition A
+n_home_only <- visit_long %>%
+  filter(!id %in% prevalent_ids & visit_type != "entry") %>%
+  group_by(id) %>%
+  summarise(only_home = all(visit_type == "home"), .groups = "drop") %>%
+  filter(only_home) %>%
+  nrow()
+
+inc_A <- incidence_data(event_A_subjects)
+```
+
+```{r}
+inc_table_A <- incidence_table(
+  inc_A,
+  title = "Table 1. Incidence of hypertension, confirmed at the first clinical visit",
+  notes = c(
+    sprintf("%s subjects with prevalent hypertension at baseline were excluded.", 
+            formatC(n_prevalent, format = "d", big.mark = ",")),
+    sprintf("%s subjects with missing baseline blood pressure and no antihypertensive medication were assumed disease free and included.", 
+            n_missing_bp),
+    sprintf("%s subjects with only home visits after entry were excluded.", n_home_only),
+    "Hypertension: blood pressure \u2265130/80 mmHg or antihypertensive medication use. 95% CIs are exact Poisson intervals."
+  )
+)
+
+inc_table_A
+```
+
+
+## Second Clinical/ Home Visit Confirmation
+The event date is the second time cumulatively a participant is observed with high blood pressure or starts medication after their entry into the study.
+
+```{r}
+event_B_subjects <- visit_long %>%
+  filter(!id %in% prevalent_ids & visit_type != "entry")%>%
+  group_by(id) %>%
+  arrange(id, visit_date) %>%
+  mutate(
+    is_high = case_when(
+      mean_sbp >= 130 | mean_dbp >= 80 | any_bp_med == 1 ~ 1,
+      TRUE ~ 0  
+    ),
+     high_num = cumsum(is_high)
+  ) %>%
+  summarise(
+    event = if_else(max(high_num) >= 2, 1, 0),
+    event_date = if_else(event == 1, 
+                         min(visit_date[high_num == 2]), 
+                         first(exit_date)),   ## fallback to exit date 
+    sex = first(sex),
+    age_at_entry = first(age), 
+    age_group = first(age_group),
+    bmi_category = first(bmi_category),
+    entry_date = first(entry_date),
+    .groups = "drop"
+  ) %>%
+  mutate(person_years = as.numeric(event_date - entry_date) / 365.25)
+
+saveRDS(event_B_subjects, here("data", "intermediate", "incident.hypertension.second.RDS"))
+
+inc_B <- incidence_data(event_B_subjects)
+```
+
+```{r}
+inc_table_B <- incidence_table(
+  inc_B,
+  title = "Table 2. Incidence of hypertension, confirmed at the second clinical or home visit",
+  notes = c(
+    sprintf("%s subjects with prevalent hypertension at baseline were excluded.", 
+            formatC(n_prevalent, format = "d", big.mark = ",")),
+    sprintf("%s subjects with missing baseline blood pressure and no antihypertensive medication were assumed disease free and included.", 
+            n_missing_bp),
+    "Hypertension: blood pressure \u2265130/80 mmHg or antihypertensive medication use. 95% CIs are exact Poisson intervals."
+  )
+)
+
+inc_table_B
+```
+
+
+## Summary
+```{r}
+total_A <- inc_A %>% filter(Group == "Total")
+total_B <- inc_B %>% filter(Group == "Total")
+
+answer_02 <- sprintf(
+  "Among %s participants without hypertension at entry, the incidence of hypertension was %.1f per 1,000 person-years (95%% CI %.1f-%.1f) when confirmed at the first clinical visit, and %.1f (95%% CI %.1f-%.1f) when confirmed at a second clinical or home visit.",
+  formatC(total_A$Disease_Free_n + total_A$Events_n, format = "d", big.mark = ","),
+  total_A$Incidence_1000, total_A$CI_lower, total_A$CI_upper,
+  total_B$Incidence_1000, total_B$CI_lower, total_B$CI_upper
+)
+```
+
+`r answer_02`
+
+```{r save results}
+## results for the dashboard
+incidence_results <- list(
+  question  = "Among participants without hypertension at entry, how often does hypertension develop, overall and by sex and age group, when it takes one versus two qualifying visits to confirm it?",
+  definitions = c(
+    "A qualifying visit has blood pressure \u2265130/80 mmHg or antihypertensive medication use.",
+    "First clinical visit: hypertension starts at the first clinical visit after entry that qualifies (scheduled and unofficial visits; home visits not counted).",
+    "Second clinical or home visit: hypertension starts at the second qualifying visit after entry, counting both clinical and home visits."
+  ),
+  answer    = answer_02,
+  tables    = list(first = inc_table_A, second = inc_table_B),
+  rates     = bind_rows(
+    inc_A %>% mutate(Definition = "First clinical visit"),
+    inc_B %>% mutate(Definition = "Second clinical or home visit")
+  ),
+  flow      = tibble(
+    Step  = c("Participants", "Prevalent hypertension at entry (excluded)", 
+              "Only home visits after entry (excluded, first-visit definition)", 
+              "At risk, first-visit definition", "At risk, second-visit definition"),
+    Count = c(n_distinct(visit_long$id), n_prevalent, n_home_only, 
+              nrow(event_A_subjects), nrow(event_B_subjects))
+  )
+)
+
+saveRDS(incidence_results, here("data", "intermediate", "02_incidence.RDS"))
+```

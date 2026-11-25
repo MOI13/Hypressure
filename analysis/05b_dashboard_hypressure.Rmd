@@ -1,0 +1,310 @@
+---
+title: "Hypressure: Hypertension Onset and Blood Pressure Change"
+author: "Xintian Song"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, message = F, warning = F)
+
+library(flexdashboard)
+library(ggplot2)
+library(shiny)
+library(plotly)
+library(flextable)
+library(gtsummary)
+library(patchwork)
+
+library(tidyverse)
+library(magrittr)
+library(here)
+
+source("00_table_style.R")
+source("00_figure_style.R")
+```
+
+```{css}
+.chart-stage { overflow: auto; }
+```
+
+```{r, include=FALSE}
+options(shiny.sanitize.errors = FALSE)
+
+results_file <- here("data", "intermediate", "dashboard_results.RDS")
+if (!file.exists(results_file)) results_file <- "dashboard_results.RDS"
+
+dash <- readRDS(results_file)
+
+qc        <- dash$qc
+incidence <- dash$incidence
+onset     <- dash$onset
+sbp       <- dash$sbp
+```
+
+```{r, include=FALSE}
+## saved tables and figures from 01-04; a message instead of an error if results are out of date
+show_table <- function(ft) {
+  validate(need(!is.null(ft), "Table not found. Rerun 05_render_report.R to update the results."))
+  ft %>%
+    set_table_properties(layout = "autofit", width = 1) %>%
+    htmltools_value()
+}
+
+show_figure <- function(fig) {
+  validate(need(!is.null(fig), "Figure not found. Rerun 05_render_report.R to update the results."))
+  fig
+}
+
+fmt_ci <- function(est, lo, hi, digits = 2) {
+  sprintf(paste0("%.", digits, "f (%.", digits, "f to %.", digits, "f)"), est, lo, hi)
+}
+
+group_choices <- c("Sex" = "sex", "Age group" = "age_group", "BMI category" = "bmi_category")
+
+bmi_levels <- levels(sbp$sbp_long$bmi_category)
+age_levels <- levels(sbp$sbp_long$age_group)
+
+predict_sbp <- function(newdata) {
+  X  <- model.matrix(~ years * (age_c10 + sex + bmi_category) + bp_med, data = newdata)
+  X  <- X[, names(sbp$fixef), drop = FALSE]
+  se <- sqrt(rowSums((X %*% sbp$vcov) * X))
+  
+  newdata %>%
+    mutate(
+      fit   = as.vector(X %*% sbp$fixef),
+      lower = fit - 1.96 * se,
+      upper = fit + 1.96 * se
+    )
+}
+```
+
+
+# Dataset Description 
+
+- **My GitHub Repo**
+  - https://github.com/MOI13/Hypressure
+
+- **Dataset**
+  - Synthetic cohort of `r format(qc$qc$Count[qc$qc$Step == "Participants"], big.mark = ",")` adults with `r format(qc$qc$Count[qc$qc$Step == "Visits in the analysis dataset"], big.mark = ",")` visits, including an entry visit, scheduled clinic visits (months 12 to 84), home visits, and unofficial visits.
+  - Hypertension: blood pressure ≥130/80 mmHg or antihypertensive medication use.
+
+
+
+# 1. Data
+
+## Column {.sidebar data-width="350"}
+
+**Question**
+
+`r qc$question`
+
+**Answer**
+
+`r qc$answer`
+
+## Column {.tabset}
+
+### Table 1. Baseline Characteristics
+
+```{r}
+renderUI(show_table(qc$tables$baseline))
+```
+
+### Table 2. Follow-up and Visits
+
+```{r}
+renderUI(show_table(qc$tables$followup))
+```
+
+
+# 2. Incidence
+
+## Column {.sidebar data-width="350"}
+
+**Question**
+
+`r incidence$question`
+
+**Event Definitions**
+
+- `r incidence$definitions[2]`
+- `r incidence$definitions[3]`
+
+**Key Takeaways**
+
+`r incidence$answer` The first clinical visit definition is used in 3. Hypertension Onset.
+
+## Column {.tabset}
+
+### First Clinical Visit
+
+```{r}
+renderUI(show_table(incidence$tables$first))
+```
+
+### Second Clinical or Home Visit
+
+```{r}
+renderUI(show_table(incidence$tables$second))
+```
+
+
+# 3. Hypertension Onset
+
+## Column {.sidebar data-width="350"}
+
+**Question**
+
+`r onset$question`
+
+**Key Takeaways**
+
+`r onset$answer`
+
+---
+
+```{r}
+selectInput("onset_group", "Cumulative incidence by:", choices = group_choices)
+```
+
+## Column {.tabset}
+
+### Cumulative Incidence
+
+```{r}
+renderPlotly({
+  
+  p <- onset$cum_inc %>%
+    filter(group_var == input$onset_group) %>%
+    ggplot(aes(x = time, y = cum_inc, color = group)) +
+    geom_step() +
+    scale_y_continuous(labels = scales::percent) +
+    scale_color_strata(input$onset_group) +
+    labs(x = "Years since entry", y = "Cumulative incidence of hypertension", color = NULL) +
+    theme_journal()
+
+  ggplotly(p)
+})
+```
+
+### Adjusted Hazard Ratios
+
+```{r}
+renderUI(show_table(onset$tables$adjusted))
+```
+
+
+
+# 4. SBP Change
+
+## Column {.sidebar data-width="350"}
+
+**Question**
+
+`r sbp$question`
+
+**Key Takeaways**
+
+`r sbp$answer`
+
+---
+
+**Predicted SBP, custom settings**
+
+```{r}
+selectInput("pred_color", "Compare:", 
+            choices = c(group_choices, "BP medication start" = "med_start"))
+
+## a setting is hidden while it is the factor being compared
+conditionalPanel(
+  "input.pred_color != 'age_group'",
+  sliderInput("pred_age", "Age at entry:", min = 20, max = 85, value = 50, step = 5)
+)
+
+conditionalPanel(
+  "input.pred_color != 'sex'",
+  radioButtons("pred_sex", "Sex:", choices = c("Female", "Male"), inline = TRUE)
+)
+
+conditionalPanel(
+  "input.pred_color != 'bmi_category'",
+  selectInput("pred_bmi", "BMI category:", choices = bmi_levels, selected = "Normal weight")
+)
+
+conditionalPanel(
+  "input.pred_color != 'med_start'",
+  selectInput("pred_med", "Starts BP medication:", 
+              choices = c("Never during follow-up" = "never", "At entry" = "0", 
+                          "At year 1" = "1", "At year 2" = "2", "At year 3" = "3",
+                          "At year 4" = "4", "At year 5" = "5", "At year 6" = "6"))
+)
+```
+
+The compared factor shows all its groups, and its setting is hidden; the other settings apply to every line.
+
+## Column {.tabset}
+
+### Mean SBP over Follow-up
+
+```{r}
+renderPlot(show_figure(sbp$fig_mean))
+```
+
+### Model Results
+
+```{r}
+renderUI(show_table(sbp$table))
+```
+
+### Predicted SBP by Group
+
+```{r}
+renderPlot(show_figure(sbp$fig_pred))
+```
+
+### Predicted SBP, Custom Settings
+
+```{r}
+renderPlotly({
+  
+  settings <- tibble(
+    age_c10      = (input$pred_age - 50) / 10,
+    sex          = factor(input$pred_sex, levels = c("Female", "Male")),
+    bmi_category = factor(input$pred_bmi, levels = bmi_levels),
+    med_start    = if (input$pred_med == "never") Inf else as.numeric(input$pred_med)
+  )
+
+  compare <- switch(input$pred_color,
+    age_group    = tibble(age_c10 = (c(25, 35, 45, 55, 70) - 50) / 10, group = age_levels),
+    sex          = tibble(sex = factor(c("Female", "Male"), levels = c("Female", "Male")), group = c("Female", "Male")),
+    bmi_category = tibble(bmi_category = factor(bmi_levels, levels = bmi_levels), group = bmi_levels),
+    med_start    = tibble(med_start = c(Inf, 0:6), group = names(med_start_colors))
+  )
+
+  plot_data <- expand_grid(
+    settings %>% select(-any_of(names(compare))),
+    compare,
+    years = seq(0, 7, by = 0.25)
+  ) %>%
+    mutate(bp_med = as.numeric(years >= med_start)) %>%
+    predict_sbp()
+
+  p <- ggplot(plot_data, aes(x = years, y = fit, color = group, fill = group)) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.06, color = NA) +
+    geom_line(aes(text = paste("\n", group, 
+                               "\nYear:", years, 
+                               "\nPredicted SBP:", fmt_ci(fit, lower, upper, digits = 1)),
+                  group = group)) +
+    scale_x_continuous(breaks = 0:7) +
+    scale_color_strata(input$pred_color) +
+    scale_fill_strata(input$pred_color) +
+    labs(x = "Years since entry", y = "Predicted SBP, mmHg (95% CI)", color = NULL, fill = NULL) +
+    theme_journal()
+
+  ggplotly(p, tooltip = "text")
+})
+```

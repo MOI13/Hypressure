@@ -1,0 +1,68 @@
+# Hypressure
+
+Analysis of hypertension onset and blood pressure change in a synthetic adult cohort, with an interactive Shiny dashboard. Written in R.
+
+The project answers four questions:
+
+1. How was the analysis dataset built, and which data quality issues were fixed?
+2. Among participants without hypertension at entry, how often does hypertension develop, overall and by sex and age group, when it takes one versus two qualifying visits to confirm it?
+3. Among participants without hypertension at entry, which baseline factors (age, sex, BMI) are associated with developing hypertension?
+4. Among participants without hypertension at entry, how does systolic BP change over follow-up, and is the rate of change associated with baseline age, sex, and BMI, after accounting for antihypertensive medication use at each visit?
+
+Hypertension is defined as blood pressure ≥130/80 mmHg or antihypertensive medication use.
+
+---
+
+## Project Structure
+
+```
+analysis/
+├── 00_table_style.R                        # journal-style table settings
+├── 00_figure_style.R                       # figure theme and color palettes
+├── 01_make_data.R                          # Q1: data cleaning, baseline covariates, Tables 1-2
+├── 02_hypertension_incidence.Rmd           # Q2: incidence rates
+├── 03_risk_factors_hypertension_onset.Rmd  # Q3: Cox models for hypertension onset
+├── 04_risk_factors_sbp_change.Rmd          # Q4: mixed-effects model for SBP change
+├── 05_render_report.R                      # runs 01-04 and bundles dashboard results
+└── 05b_dashboard_hypressure.Rmd            # Shiny dashboard
+data/
+├── raw/                                    # baseline_df.csv, visits_df.csv, outcomes_df.csv
+└── intermediate/                           # cleaned data and saved results
+report/                                     # compiled HTML reports
+```
+
+---
+
+## File Paths of Interest
+
+### 1. Merged Longitudinal Dataset
+* **Path:** `data/intermediate/visit_long.RDS`
+
+### 2. Compiled Analysis Reports (HTML)
+* **Path 1:** `report/hypertension_incidence.html`
+* **Path 2:** `report/risk_factors_hypertension_onset.html`
+* **Path 3:** `report/risk_factors_sbp_change.html`
+
+---
+
+## How to Recreate the Dataset, HTML Reports, and Dashboard
+1. **Open the RStudio project.**
+2. **Execute the scripts in order:**
+
+   * **Step 2a: Recreate the dataset and compile the HTML reports** 
+     ```r
+     source(here::here("analysis", "05_render_report.R"))
+     # This runs 01_make_data.R, which saves 'visit_long.RDS' to data/intermediate/,
+     # then compiles 02-04 to report/ and saves 'dashboard_results.RDS' to data/intermediate/.
+     ```
+
+   * **Step 2b: Launch the dashboard** 
+     ```r
+     rmarkdown::run(here::here("analysis", "05b_dashboard_hypressure.Rmd"))
+     ```
+
+
+---
+
+## Data
+The data are synthetic and contain no real participant information.
