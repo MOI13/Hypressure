@@ -1,6 +1,17 @@
-.Rproj.user
+# R session files
+.Rproj.user/
 .Rhistory
 .RData
+.RDataTmp*
 .Ruserdata
-.pdf
 
+# editor and OS files
+.vscode/
+.DS_Store
+Thumbs.db
+
+# exercise prompt (not ours to share)
+washu_stat_data_analyst_exercise.pdf
+
+# shinyapps.io deployment records
+rsconnect/
