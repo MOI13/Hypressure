@@ -188,7 +188,6 @@ fixed_adj <- tidy_lmer(m_adj)
 
 ```{r}
 ## table built from the coefficients directly
-## (gtsummary's tbl_regression() requires broom.mixed for mixed models)
 term_labels <- c(
   "years"                   = "Years since entry (reference group)",
   "age_c10"                 = "Age, per 10 years",

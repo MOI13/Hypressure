@@ -2,7 +2,7 @@
 
 Analysis of hypertension onset and blood pressure change in a synthetic adult cohort, with an interactive Shiny dashboard. Written in R.
 
-**Live dashboard:** [link to be added after publishing on shinyapps.io]
+**Live dashboard:** [https://shirley-song.shinyapps.io/dashboard_hypressure/](https://shirley-song.shinyapps.io/dashboard_hypressure/)
 
 The project answers four questions:
 
