@@ -5,6 +5,9 @@
 .RDataTmp*
 .Ruserdata
 
+# copy of the dashboard results for shinyapps.io deployment
+analysis/*.RDS
+
 # editor and OS files
 .vscode/
 .DS_Store
